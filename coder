@@ -1,10 +1,29 @@
 #!/bin/bash
 
-# Start the server in the background
-uv run -m uvicorn server:app --host 0.0.0.0 --port 8082 &
+# Check if the server is already running on port 8082
+echo "Checking for server on port 8082..."
+PID=$(lsof -ti:8082)
 
-# Wait for a moment to ensure the server starts
-sleep 2
+# If server is NOT running, then start it in a new iTerm window
+if [ -z "$PID" ]; then
+    echo "No server found on port 8082. Starting new server..."
+    osascript <<EOF
+tell application "iTerm"
+    activate
+    tell (create window with default profile)
+        tell current session
+            write text "echo 'Starting Uvicorn server in this new iTerm window...' && PYTHONPATH=\"/Users/yungkronos/claude-code-openai/:$PYTHONPATH\" uv run --project /Users/yungkronos/claude-code-openai/ -m uvicorn server:app --host 0.0.0.0 --port 8082"
+        end tell
+    end tell
+end tell
+EOF
+    # Wait for a moment to ensure the server starts
+    echo "Waiting for server to initialize..."
+    sleep 2
+    echo "Server start-up sequence complete."
+else
+    echo "Server already running on port 8082 (PID: $PID). Not starting a new one."
+fi
 
 # Run claude with the specified environment variable
 ANTHROPIC_BASE_URL=http://localhost:8082 claude "$@"
