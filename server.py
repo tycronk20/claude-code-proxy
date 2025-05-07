@@ -109,6 +109,7 @@ OPENAI_MODELS = [
 # List of Gemini models
 GEMINI_MODELS = [
     "gemini-2.5-pro-preview-03-25",
+    "gemini-2.5-pro-preview-05-06", 
     "gemini-2.0-flash"
 ]
 
@@ -1078,6 +1079,13 @@ async def create_message(
     request: MessagesRequest,
     raw_request: Request
 ):
+    # Special handling for "think" command
+    if (len(request.messages) == 1 and 
+        request.messages[0].role == "user" and
+        isinstance(request.messages[0].content, str) and
+        request.messages[0].content.strip().lower() == "think"):
+        # Set thinking config properly
+        request.thinking = ThinkingConfig(enabled=True)
     try:
         # print the body here
         body = await raw_request.body()
@@ -1310,9 +1318,14 @@ async def create_message(
         }
         
         # Check for LiteLLM-specific attributes
-        for attr in ['message', 'status_code', 'response', 'llm_provider', 'model']:
+        for attr in ['message', 'status_code', 'llm_provider', 'model']:
             if hasattr(e, attr):
                 error_details[attr] = getattr(e, attr)
+        
+        # Handle 'response' attribute specially
+        if hasattr(e, 'response'):
+            response_attr = getattr(e, 'response')
+            error_details['response'] = str(response_attr)
         
         # Check for additional exception details in dictionaries
         if hasattr(e, '__dict__'):
