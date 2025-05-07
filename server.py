@@ -170,7 +170,14 @@ class Tool(BaseModel):
     input_schema: Dict[str, Any]
 
 class ThinkingConfig(BaseModel):
-    enabled: bool
+    enabled: bool = False
+    budget_tokens: Optional[int] = None
+    type: Optional[str] = None
+    
+    @classmethod
+    def enabled_config(cls):
+        """Create a default enabled thinking config"""
+        return cls(enabled=True)
 
 class MessagesRequest(BaseModel):
     model: str
@@ -187,6 +194,18 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[Dict[str, Any]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
+    
+    # Handle thinking field if it's a dict with budget_tokens and type but no enabled field
+    @field_validator('thinking')
+    def validate_thinking(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, dict) and 'budget_tokens' in v and 'type' in v and 'enabled' not in v:
+            if v.get('type') == 'enabled':
+                # Convert dict to ThinkingConfig with enabled=True
+                logger.debug(f"Converting thinking dict to ThinkingConfig: {v}")
+                return ThinkingConfig(enabled=True, budget_tokens=v.get('budget_tokens'), type=v.get('type'))
+        return v
     
     @field_validator('model')
     def validate_model_field(cls, v, info): # Renamed to avoid conflict
@@ -257,6 +276,17 @@ class TokenCountRequest(BaseModel):
     thinking: Optional[ThinkingConfig] = None
     tool_choice: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None  # Will store the original model name
+    
+    # Handle thinking field if it's a dict with budget_tokens and type but no enabled field
+    @field_validator('thinking')
+    def validate_thinking(cls, v):
+        if v is None:
+            return v
+        if isinstance(v, dict) and 'budget_tokens' in v and 'type' in v and 'enabled' not in v:
+            if v.get('type') == 'enabled':
+                # Convert dict to ThinkingConfig with enabled=True
+                return ThinkingConfig(enabled=True, budget_tokens=v.get('budget_tokens'), type=v.get('type'))
+        return v
     
     @field_validator('model')
     def validate_model_token_count(cls, v, info): # Renamed to avoid conflict
@@ -1199,21 +1229,32 @@ async def create_message(
     request: MessagesRequest,
     raw_request: Request
 ):
-    # Special handling for "think" command
-    if (len(request.messages) == 1 and 
-        request.messages[0].role == "user" and
-        isinstance(request.messages[0].content, str) and
-        request.messages[0].content.strip().lower() == "think"):
-        # Set thinking config properly
-        request.thinking = ThinkingConfig(enabled=True)
     try:
-        # print the body here
+        # Read the raw body once and reuse it
         body = await raw_request.body()
-    
-        # Parse the raw body as JSON since it's bytes
-        body_json = json.loads(body.decode('utf-8'))
+        body_str = body.decode('utf-8')
+        body_json = json.loads(body_str)
+        
+        # Store original model from request
         original_model = body_json.get("model", "unknown")
         
+        # Handle the case where thinking has {'budget_tokens': X, 'type': 'enabled'} format
+        raw_thinking = body_json.get('thinking')
+        if isinstance(raw_thinking, dict) and 'type' in raw_thinking and raw_thinking.get('type') == 'enabled' and 'enabled' not in raw_thinking:
+            logger.debug(f"Converting raw thinking config: {raw_thinking}")
+            request.thinking = ThinkingConfig(enabled=True, 
+                                             budget_tokens=raw_thinking.get('budget_tokens'), 
+                                             type=raw_thinking.get('type'))
+        
+        # Special handling for "think" command
+        if (len(request.messages) == 1 and 
+            request.messages[0].role == "user" and
+            isinstance(request.messages[0].content, str) and
+            request.messages[0].content.strip().lower() == "think"):
+            # Set thinking config properly using the factory method
+            logger.debug("Detected 'think' command, enabling thinking mode")
+            request.thinking = ThinkingConfig.enabled_config()
+            
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
         if "/" in display_model:
