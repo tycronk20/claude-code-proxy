@@ -96,6 +96,7 @@ The following OpenAI models are supported with automatic `openai/` prefix handli
 #### Gemini Models
 The following Gemini models are supported with automatic `gemini/` prefix handling:
 - gemini-2.5-pro-preview-03-25
+- gemini-2.5-pro-preview-05-06
 - gemini-2.0-flash
 
 ### Model Prefix Handling
