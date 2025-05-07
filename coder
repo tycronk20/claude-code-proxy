@@ -1,0 +1,10 @@
+#!/bin/bash
+
+# Start the server in the background
+uv run -m uvicorn server:app --host 0.0.0.0 --port 8082 &
+
+# Wait for a moment to ensure the server starts
+sleep 2
+
+# Run claude with the specified environment variable
+ANTHROPIC_BASE_URL=http://localhost:8082 claude "$@"
