@@ -42,6 +42,14 @@ A proxy server that lets you use Anthropic clients with Gemini or OpenAI models 
    *   `PREFERRED_PROVIDER` (Optional): Set to `openai` (default) or `google`. This determines the primary backend for mapping `haiku`/`sonnet`.
    *   `BIG_MODEL` (Optional): The model to map `sonnet` requests to. Defaults to `gpt-4.1` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.5-pro-preview-03-25`.
    *   `SMALL_MODEL` (Optional): The model to map `haiku` requests to. Defaults to `gpt-4.1-mini` (if `PREFERRED_PROVIDER=openai`) or `gemini-2.0-flash`.
+   
+   **Secure API Key Storage (macOS)**:
+   Alternatively, you can store your API keys in macOS Keychain and use our script to update .env:
+   ```bash
+   pip install keyring python-dotenv
+   ./update_env_keyring.py
+   ```
+   See [KEYCHAIN_SETUP.md](./KEYCHAIN_SETUP.md) for detailed setup instructions.
 
    **Mapping Logic:**
    - If `PREFERRED_PROVIDER=openai` (default), `haiku`/`sonnet` map to `SMALL_MODEL`/`BIG_MODEL` prefixed with `openai/`.
