@@ -855,8 +855,93 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         has_sent_stop_reason = False
         last_tool_index = 0
         
-        # Process each chunk
-        async for chunk in response_generator:
+        # Create a wrapper for the original generator to handle JSON parsing errors
+        async def safe_generator():
+            try:
+                async for chunk in response_generator:
+                    # Check if this is a raw string that needs to be parsed
+                    if isinstance(chunk, str):
+                        try:
+                            # Try to parse the string as JSON
+                            json_data = json.loads(chunk)
+                            
+                            # Create a simplified chunk object that matches the expected structure
+                            class SimpleChunk:
+                                def __init__(self):
+                                    self.choices = []
+                                    self.usage = None
+                            
+                            chunk_obj = SimpleChunk()
+                            
+                            # Add a choice with delta content if available
+                            if "content" in json_data:
+                                class SimpleChoice:
+                                    def __init__(self):
+                                        self.finish_reason = None
+                                        self.delta = type('obj', (object,), {"content": json_data["content"]})
+                                
+                                chunk_obj.choices.append(SimpleChoice())
+                            
+                            # Set finish_reason if available
+                            if "finish_reason" in json_data:
+                                if chunk_obj.choices:
+                                    chunk_obj.choices[0].finish_reason = json_data["finish_reason"]
+                            
+                            # Set usage if available
+                            if "usage" in json_data:
+                                chunk_obj.usage = type('obj', (object,), {
+                                    "prompt_tokens": json_data["usage"].get("prompt_tokens", 0),
+                                    "completion_tokens": json_data["usage"].get("completion_tokens", 0)
+                                })
+                            
+                            logger.debug(f"Successfully parsed string JSON chunk: {json_data}")
+                            yield chunk_obj
+                        except json.JSONDecodeError as e:
+                            logger.warning(f"Unable to parse chunk as JSON: {e}, chunk: {chunk[:50]}...")
+                            # If we can't parse JSON but it has content-like structure, try to extract it
+                            if "{" in chunk and "content" in chunk:
+                                try:
+                                    # Create a simple chunk with the raw text
+                                    class SimpleChunk:
+                                        def __init__(self):
+                                            self.choices = []
+                                            self.usage = None
+                                    
+                                    chunk_obj = SimpleChunk()
+                                    
+                                    # Try to extract content with basic pattern matching
+                                    content_match = re.search(r'"content"\s*:\s*"([^"]*)"', chunk)
+                                    if content_match:
+                                        text_content = content_match.group(1)
+                                        
+                                        class SimpleChoice:
+                                            def __init__(self):
+                                                self.finish_reason = None
+                                                self.delta = type('obj', (object,), {"content": text_content})
+                                        
+                                        chunk_obj.choices.append(SimpleChoice())
+                                        logger.debug(f"Extracted content from invalid JSON: {text_content}")
+                                        yield chunk_obj
+                                    else:
+                                        # Skip this chunk if we can't extract anything useful
+                                        logger.warning(f"Skipping malformed chunk, couldn't extract content")
+                                        continue
+                                except Exception as ex:
+                                    logger.error(f"Error processing malformed chunk: {ex}")
+                                    continue
+                            else:
+                                # Skip this chunk if it doesn't have usable content
+                                continue
+                    else:
+                        # Pass through normal chunk objects
+                        yield chunk
+            except Exception as e:
+                logger.error(f"Error in safe_generator: {str(e)}")
+                # We'll handle this in the outer try-except
+                raise
+        
+        # Process each chunk with our safe generator
+        async for chunk in safe_generator():
             try:
 
                 
@@ -1035,7 +1120,23 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                         return
             except Exception as e:
                 # Log error but continue processing other chunks
-                logger.error(f"Error processing chunk: {str(e)}")
+                logger.error(f"Error processing chunk: {str(e)}, type: {type(chunk).__name__}")
+                
+                # Add detailed traceback for debugging
+                import traceback
+                logger.error(f"Chunk processing traceback: {traceback.format_exc()}")
+                
+                # Try to log some details about the chunk for debugging
+                try:
+                    if hasattr(chunk, 'choices'):
+                        logger.error(f"Chunk had {len(chunk.choices)} choices")
+                    elif isinstance(chunk, dict):
+                        logger.error(f"Chunk keys: {list(chunk.keys())}")
+                    elif isinstance(chunk, str):
+                        logger.error(f"Chunk preview: {chunk[:100]}")
+                except Exception as inner_e:
+                    logger.error(f"Error inspecting chunk: {str(inner_e)}")
+                
                 continue
         
         # If we didn't get a finish reason, close any open blocks
@@ -1065,8 +1166,27 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         error_message = f"Error in streaming: {str(e)}\n\nFull traceback:\n{error_traceback}"
         logger.error(error_message)
         
-        # Send error message_delta
-        yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+        # Close any open text content block if it exists but wasn't closed
+        if not text_block_closed:
+            # If we've accumulated any text, send it before stopping
+            if accumulated_text and not text_sent:
+                try:
+                    yield f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': 0, 'delta': {'type': 'text_delta', 'text': 'Error: ' + str(e)}})}\n\n"
+                except:
+                    # If that fails, try a simpler approach
+                    yield "event: content_block_delta\ndata: {\"type\": \"content_block_delta\", \"index\": 0, \"delta\": {\"type\": \"text_delta\", \"text\": \"Error occurred\"}}\n\n"
+            
+            # Close the text block
+            try:
+                yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+            except:
+                yield "event: content_block_stop\ndata: {\"type\": \"content_block_stop\", \"index\": 0}\n\n"
+        
+        # Send error message_delta with details
+        try:
+            yield f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': 'error', 'stop_sequence': None}, 'usage': {'output_tokens': 0}})}\n\n"
+        except:
+            yield "event: message_delta\ndata: {\"type\": \"message_delta\", \"delta\": {\"stop_reason\": \"error\"}, \"usage\": {\"output_tokens\": 0}}\n\n"
         
         # Send message_stop event
         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
@@ -1278,8 +1398,31 @@ async def create_message(
                 200  # Assuming success at this point
             )
             # Ensure we use the async version for streaming
-            response_generator = await litellm.acompletion(**litellm_request)
+            # Add special handling for Gemini 2.5 Pro Preview 05-06 which has known JSON issues
+            if "gemini-2.5-pro-preview-05-06" in litellm_request.get('model', ''):
+                logger.warning("Using Gemini 2.5 Pro Preview 05-06, adding extra error handling for streaming")
+                # Add extra parameters for Gemini to ensure most reliable streaming experience
+                litellm_request["complete_response"] = False  # Get raw response
+                
+                # Use custom wrapper for handling
+                try:
+                    response_generator = await litellm.acompletion(**litellm_request)
+                    logger.debug("Successfully initialized Gemini 2.5 Pro Preview 05-06 streaming response")
+                except Exception as e:
+                    # If we hit an error immediately, try without streaming
+                    logger.error(f"Error initializing Gemini 2.5 streaming: {str(e)}, falling back to non-streaming")
+                    # Use non-streaming as fallback
+                    litellm_request["stream"] = False
+                    litellm_response = await litellm.acompletion(**litellm_request)
+                    # Convert to Anthropic format
+                    anthropic_response = convert_litellm_to_anthropic(litellm_response, request)
+                    # Return as JSON response instead of streaming
+                    return anthropic_response
+            else:
+                # Normal streaming for other models
+                response_generator = await litellm.acompletion(**litellm_request)
             
+            # Return streaming response
             return StreamingResponse(
                 handle_streaming(response_generator, request),
                 media_type="text/event-stream"
