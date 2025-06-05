@@ -8,6 +8,7 @@ import httpx
 import os
 from fastapi.responses import JSONResponse, StreamingResponse
 import litellm
+litellm._turn_on_debug() # Added to enable LiteLLM debug logging
 import uuid
 import time
 from dotenv import load_dotenv
@@ -15,12 +16,25 @@ import re
 from datetime import datetime
 import sys
 
-# Load environment variables from .env file
-load_dotenv()
+# Get API keys from environment first (from .zshrc and other shell exports)
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")  
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+
+# Only load .env file for missing keys (don't override existing environment variables)
+if not all([ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY]):
+    load_dotenv(override=False)  # Don't override existing env vars
+    # Re-read any missing keys after loading .env
+    if not ANTHROPIC_API_KEY:
+        ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+    if not OPENAI_API_KEY:
+        OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+    if not GEMINI_API_KEY:
+        GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 # Configure logging
 logging.basicConfig(
-    level=logging.WARN,  # Change to INFO level to show more details
+    level=logging.INFO,  # Change to INFO level to show more details
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
@@ -31,6 +45,7 @@ import uvicorn
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.DEBUG) # Added to see HTTPX debug logs for streaming
 
 # Create a filter to block any log messages containing specific strings
 class MessageFilter(logging.Filter):
@@ -77,10 +92,7 @@ for handler in logger.handlers:
 
 app = FastAPI()
 
-# Get API keys from environment
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+# API keys are already loaded above
 
 # Get preferred provider (default to openai)
 PREFERRED_PROVIDER = os.environ.get("PREFERRED_PROVIDER", "openai").lower()
@@ -110,6 +122,7 @@ OPENAI_MODELS = [
 GEMINI_MODELS = [
     "gemini-2.5-pro-preview-03-25",
     "gemini-2.5-pro-preview-05-06", 
+    "gemini-2.5-flash-preview-05-20",
     "gemini-2.0-flash"
 ]
 
@@ -194,6 +207,7 @@ class MessagesRequest(BaseModel):
     tool_choice: Optional[Dict[str, Any]] = None
     thinking: Optional[ThinkingConfig] = None
     original_model: Optional[str] = None  # Will store the original model name
+    model_size: Optional[str] = None  # Will store the model size (big/small) for thinking budget configuration
     
     # Handle thinking field if it's a dict with budget_tokens and type but no enabled field
     @field_validator('thinking')
@@ -225,8 +239,11 @@ class MessagesRequest(BaseModel):
 
         # --- Mapping Logic --- START ---
         mapped = False
+        model_size = None  # Track if this is big or small model mapping
+        
         # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
+            model_size = "small"
             if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
@@ -236,6 +253,7 @@ class MessagesRequest(BaseModel):
 
         # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
+            model_size = "big"
             if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
@@ -254,17 +272,19 @@ class MessagesRequest(BaseModel):
         # --- Mapping Logic --- END ---
 
         if mapped:
-            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}'")
+            logger.debug(f"📌 MODEL MAPPING: '{original_model}' ➡️ '{new_model}' (size: {model_size})")
         else:
              # If no mapping occurred and no prefix exists, log warning or decide default
              if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
                  logger.warning(f"⚠️ No prefix or mapping rule for model: '{original_model}'. Using as is.")
              new_model = v # Ensure we return the original if no rule applied
 
-        # Store the original model in the values dictionary
+        # Store the original model and mapping info in the values dictionary
         values = info.data
         if isinstance(values, dict):
             values['original_model'] = original_model
+            if model_size:
+                values['model_size'] = model_size
 
         return new_model
 
@@ -276,6 +296,7 @@ class TokenCountRequest(BaseModel):
     thinking: Optional[ThinkingConfig] = None
     tool_choice: Optional[Dict[str, Any]] = None
     original_model: Optional[str] = None  # Will store the original model name
+    model_size: Optional[str] = None  # Will store the model size (big/small) for thinking budget configuration
     
     # Handle thinking field if it's a dict with budget_tokens and type but no enabled field
     @field_validator('thinking')
@@ -309,8 +330,11 @@ class TokenCountRequest(BaseModel):
 
         # --- Mapping Logic --- START ---
         mapped = False
+        model_size = None  # Track if this is big or small model mapping
+        
         # Map Haiku to SMALL_MODEL based on provider preference
         if 'haiku' in clean_v.lower():
+            model_size = "small"
             if PREFERRED_PROVIDER == "google" and SMALL_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{SMALL_MODEL}"
                 mapped = True
@@ -320,6 +344,7 @@ class TokenCountRequest(BaseModel):
 
         # Map Sonnet to BIG_MODEL based on provider preference
         elif 'sonnet' in clean_v.lower():
+            model_size = "big"
             if PREFERRED_PROVIDER == "google" and BIG_MODEL in GEMINI_MODELS:
                 new_model = f"gemini/{BIG_MODEL}"
                 mapped = True
@@ -338,16 +363,18 @@ class TokenCountRequest(BaseModel):
         # --- Mapping Logic --- END ---
 
         if mapped:
-            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}'")
+            logger.debug(f"📌 TOKEN COUNT MAPPING: '{original_model}' ➡️ '{new_model}' (size: {model_size})")
         else:
              if not v.startswith(('openai/', 'gemini/', 'anthropic/')):
                  logger.warning(f"⚠️ No prefix or mapping rule for token count model: '{original_model}'. Using as is.")
              new_model = v # Ensure we return the original if no rule applied
 
-        # Store the original model in the values dictionary
+        # Store the original model and mapping info in the values dictionary
         values = info.data
         if isinstance(values, dict):
             values['original_model'] = original_model
+            if model_size:
+                values['model_size'] = model_size
 
         return new_model
 
@@ -645,14 +672,37 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
             # Default to auto if we can't determine
             litellm_request["tool_choice"] = "auto"
     
+    # Add thinking parameters if present and supported
+    if anthropic_request.thinking and anthropic_request.thinking.enabled:
+        is_gemini_model = anthropic_request.model.startswith("gemini/")
+        if is_gemini_model:
+            # For Gemini models, add thinking configuration
+            logger.debug(f"Adding thinking config for Gemini model: enabled={anthropic_request.thinking.enabled}, budget_tokens={anthropic_request.thinking.budget_tokens}")
+            
+            thinking_config = {"enabled": True}
+            if anthropic_request.thinking.budget_tokens is not None:
+                thinking_config["budget_tokens"] = anthropic_request.thinking.budget_tokens
+            if anthropic_request.thinking.type is not None:
+                thinking_config["type"] = anthropic_request.thinking.type
+                
+            litellm_request["thinking"] = thinking_config
+        else:
+            logger.debug(f"Thinking config provided but not supported for model: {anthropic_request.model}")
+    
     return litellm_request
 
 def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any], 
                                  original_request: MessagesRequest) -> MessagesResponse:
-    """Convert LiteLLM (OpenAI format) response to Anthropic API response format."""
+    """Convert LiteLLM (OpenAI format) response to Anthropic format."""
     
     # Enhanced response extraction with better error handling
     try:
+        # Add debug logging to see the actual response structure
+        logger.debug(f"🔍 RESPONSE DEBUG: Response type: {type(litellm_response)}")
+        
+        if hasattr(litellm_response, '__dict__'):
+            logger.debug(f"🔍 RESPONSE DEBUG: Response attributes: {list(litellm_response.__dict__.keys())}")
+        
         # Get the clean model name to check capabilities
         clean_model = original_request.model
         if clean_model.startswith("anthropic/"):
@@ -663,16 +713,52 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
         # Check if this is a Claude model (which supports content blocks)
         is_claude_model = clean_model.startswith("claude-")
         
+        # Check if thinking was enabled for this request
+        thinking_enabled = (original_request.thinking and 
+                          original_request.thinking.enabled and 
+                          original_request.thinking.budget_tokens and 
+                          original_request.thinking.budget_tokens > 0)
+        
         # Handle ModelResponse object from LiteLLM
         if hasattr(litellm_response, 'choices') and hasattr(litellm_response, 'usage'):
             # Extract data from ModelResponse object directly
             choices = litellm_response.choices
             message = choices[0].message if choices and len(choices) > 0 else None
+            
+            # Debug log the message structure
+            if message:
+                logger.debug(f"🔍 MESSAGE DEBUG: Message type: {type(message)}")
+                if hasattr(message, '__dict__'):
+                    logger.debug(f"🔍 MESSAGE DEBUG: Message attributes: {list(message.__dict__.keys())}")
+                logger.debug(f"🔍 MESSAGE DEBUG: Content: {getattr(message, 'content', 'NO_CONTENT')}")
+                logger.debug(f"🔍 MESSAGE DEBUG: Content type: {type(getattr(message, 'content', None))}")
+                
+                # Check for reasoning_content field (for Gemini thinking models)
+                if hasattr(message, 'reasoning_content'):
+                    logger.debug(f"🔍 MESSAGE DEBUG: Found reasoning_content: {getattr(message, 'reasoning_content', '')}")
+            
+            # Extract content and reasoning_content
             content_text = message.content if message and hasattr(message, 'content') else ""
+            reasoning_content = message.reasoning_content if message and hasattr(message, 'reasoning_content') else ""
+            
+            # For Gemini models with thinking enabled, combine reasoning and regular content
+            if thinking_enabled and reasoning_content:
+                logger.debug(f"🔍 THINKING DEBUG: Combining reasoning_content with regular content")
+                # If there's no regular content but we have reasoning content, use the reasoning content
+                if not content_text and reasoning_content:
+                    content_text = reasoning_content
+                # If we have both, combine them
+                elif content_text and reasoning_content:
+                    content_text = f"{reasoning_content}\n\n{content_text}"
+            
             tool_calls = message.tool_calls if message and hasattr(message, 'tool_calls') else None
             finish_reason = choices[0].finish_reason if choices and len(choices) > 0 else "stop"
             usage_info = litellm_response.usage
             response_id = getattr(litellm_response, 'id', f"msg_{uuid.uuid4()}")
+            
+            # Log the extracted content for debugging
+            logger.debug(f"🔍 CONTENT DEBUG: Final extracted content: '{content_text}' (type: {type(content_text)})")
+            
         else:
             # For backward compatibility - handle dict responses
             # If response is a dict, use it, otherwise try to convert to dict
@@ -694,6 +780,18 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
             choices = response_dict.get("choices", [{}])
             message = choices[0].get("message", {}) if choices and len(choices) > 0 else {}
             content_text = message.get("content", "")
+            reasoning_content = message.get("reasoning_content", "")
+            
+            # For Gemini models with thinking enabled, combine reasoning and regular content
+            if thinking_enabled and reasoning_content:
+                logger.debug(f"🔍 THINKING DEBUG (dict): Combining reasoning_content with regular content")
+                # If there's no regular content but we have reasoning content, use the reasoning content
+                if not content_text and reasoning_content:
+                    content_text = reasoning_content
+                # If we have both, combine them
+                elif content_text and reasoning_content:
+                    content_text = f"{reasoning_content}\n\n{content_text}"
+            
             tool_calls = message.get("tool_calls", None)
             finish_reason = choices[0].get("finish_reason", "stop") if choices and len(choices) > 0 else "stop"
             usage_info = response_dict.get("usage", {})
@@ -845,6 +943,12 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
 async def handle_streaming(response_generator, original_request: MessagesRequest):
     """Handle streaming responses from LiteLLM and convert to Anthropic format."""
     try:
+        # Check if thinking was enabled for this request
+        thinking_enabled = (original_request.thinking and 
+                          original_request.thinking.enabled and 
+                          original_request.thinking.budget_tokens and 
+                          original_request.thinking.budget_tokens > 0)
+        
         # Send message_start event
         message_id = f"msg_{uuid.uuid4().hex[:24]}"  # Format similar to Anthropic's IDs
         
@@ -878,6 +982,7 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
         current_tool_call = None
         tool_content = ""
         accumulated_text = ""  # Track accumulated text content
+        accumulated_reasoning = ""  # Track accumulated reasoning content
         text_sent = False  # Track if we've sent any text content
         text_block_closed = False  # Track if text block is closed
         input_tokens = 0
@@ -996,14 +1101,33 @@ async def handle_streaming(response_generator, original_request: MessagesRequest
                     # Check for finish_reason to know when we're done
                     finish_reason = getattr(choice, 'finish_reason', None)
                     
-                    # Process text content
+                    # Process text content and reasoning content
                     delta_content = None
+                    delta_reasoning = None
                     
                     # Handle different formats of delta content
                     if hasattr(delta, 'content'):
                         delta_content = delta.content
                     elif isinstance(delta, dict) and 'content' in delta:
                         delta_content = delta['content']
+                    
+                    # Handle reasoning content for Gemini thinking models
+                    if hasattr(delta, 'reasoning_content'):
+                        delta_reasoning = delta.reasoning_content
+                    elif isinstance(delta, dict) and 'reasoning_content' in delta:
+                        delta_reasoning = delta['reasoning_content']
+                    
+                    # For Gemini models with thinking, combine reasoning and regular content
+                    if thinking_enabled and delta_reasoning:
+                        logger.debug(f"🔍 STREAMING DEBUG: Found reasoning_content in delta: {delta_reasoning[:50]}...")
+                        accumulated_reasoning += delta_reasoning
+                        
+                        # If there's no regular content, stream the reasoning content as text
+                        if not delta_content:
+                            delta_content = delta_reasoning
+                        # If we have both, combine them
+                        else:
+                            delta_content = f"{delta_reasoning}\n\n{delta_content}"
                     
                     # Accumulate text content
                     if delta_content is not None and delta_content != "":
@@ -1254,7 +1378,23 @@ async def create_message(
             # Set thinking config properly using the factory method
             logger.debug("Detected 'think' command, enabling thinking mode")
             request.thinking = ThinkingConfig.enabled_config()
+        
+        # Auto-configure thinking budget based on model size mapping
+        # Only apply if no explicit thinking config was provided and this is a Gemini 2.5 Flash model
+        if (request.thinking is None and 
+            request.model_size is not None and 
+            request.model.startswith("gemini/") and 
+            "gemini-2.5-flash-preview-05-20" in request.model):
             
+            if request.model_size == "big":
+                # Big model (sonnet mapping) gets thinking budget of 24576
+                request.thinking = ThinkingConfig(enabled=True, budget_tokens=24576, type="enabled")
+                logger.debug(f"Auto-configured thinking for BIG model: budget_tokens=24576")
+            elif request.model_size == "small":
+                # Small model (haiku mapping) gets thinking budget of 0 (disabled)
+                request.thinking = ThinkingConfig(enabled=False, budget_tokens=0, type="disabled")
+                logger.debug(f"Auto-configured thinking for SMALL model: budget_tokens=0 (disabled)")
+        
         # Get the display name for logging, just the model name without provider prefix
         display_model = original_model
         if "/" in display_model:
